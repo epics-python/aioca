@@ -24,6 +24,7 @@ from typing import (
     Union,
     overload,
 )
+import warnings
 
 from epicscorelibs.ca import cadef, dbr
 
@@ -1024,8 +1025,8 @@ async def cainfo_array(pvs: PVs, wait=True, **kwargs):
 
 
 class _Context:
-    _ca_available = False
     _ca_context = None
+    _should_destroy = False
     _channel_caches: Dict[asyncio.AbstractEventLoop, ChannelCache] = {}
 
     @classmethod
@@ -1037,8 +1038,13 @@ class _Context:
 
     @classmethod
     def _ensure_context(cls):
-        if not cls._ca_available:
-            if not cadef.ca_current_context():
+        current_context = cadef.ca_current_context()
+        if not cls._ca_context:
+            # We have never seen a CA context, so work out which one to use
+            if current_context:
+                # There is one already for this thread, use it always
+                cls._ca_context = current_context
+            else:
                 # There is no CA context available for us to use, make one
                 cadef.ca_context_create(1)
                 # EPICS Channel Access event dispatching needs to done with a little
@@ -1049,11 +1055,24 @@ class _Context:
                 # cope with all of our channel access events occuring
                 # asynchronously.
                 cls._ca_context = cadef.ca_current_context()
-            cls._ca_available = True
-            atexit.register(cls._destroy_context)
+                # We made the context, so we should also destroy it
+                cls._should_destroy = True
+            atexit.register(cls._teardown)
+        elif current_context != cls._ca_context:
+            if current_context:
+                # There is already a CA context for this thread, but it is not
+                # the one we first saw, so warn and detach
+                warnings.warn(
+                    "There is already a CA context for this thread. "
+                              "Detaching and using the first CA context seen by aioca. "
+                              "Did you mean to use aioca in a thread that has already done CA?"
+                              )
+                cadef.ca_detach_context()
+            # Attach to our CA context
+            cadef.ca_attach_context(cls._ca_context)
 
     @classmethod
-    def _destroy_context(cls):  # pragma: no cover
+    def _teardown(cls):  # pragma: no cover
         # On exit we do our best to ensure that channel access shuts down cleanly.
         # We do this by shutting down all channels and clearing the channel access
         # context: this should reduce the risk of unexpected errors during
@@ -1061,7 +1080,7 @@ class _Context:
         #    One reason that it's rather important to do this properly is that we
         # can't safely do *any* ca_ calls once ca_context_destroy() is called!
         cls.purge_channel_caches()
-        if cls._ca_context:
+        if cls._should_destroy:
             # Make sure we are attached to that context
             cadef.ca_detach_context()
             cadef.ca_attach_context(cls._ca_context)
@@ -1069,22 +1088,19 @@ class _Context:
             cadef.ca_context_destroy()
             cadef.ca_detach_context()
             cls._ca_context = None
-        cls._ca_available = False
+            cls._should_destroy = False
 
     @classmethod
     def get_channel_cache(cls):
-        cls._ensure_context()
         loop = asyncio.get_event_loop()
         try:
             channel_cache = cls._channel_caches[loop]
         except KeyError:
-            # Channel from new event loop. Don't support multiple event loops, so
-            # clear out all the old channels
-            cls.purge_channel_caches()
+            # Channel from new event loop, so make a new ChannelCache for it
+            cls._ensure_context()
             channel_cache = ChannelCache(loop)
             cls._channel_caches[loop] = channel_cache
         return channel_cache
-
 
 purge_channel_caches = _Context.purge_channel_caches
 
